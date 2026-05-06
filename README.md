@@ -49,6 +49,8 @@ curl -X POST http://localhost:4000/trigger-sync
 - CD can also be triggered manually (`workflow_dispatch`) with environment choice:
   - `staging` -> tags image as `staging`
   - `production` -> tags image as `latest`
+- Manual `production` runs require setting `confirm_production` to `deploy-production`.
+- If omitted, the workflow fails fast with a clear error message and no build/deploy starts.
 - CD always pushes image tags to GHCR (`ghcr.io/<owner>/<repo>`).
 - Optional deploy webhook step uses these GitHub Actions secrets:
   - `DEPLOY_WEBHOOK_URL_STAGING` for `develop`
