@@ -1,0 +1,27 @@
+version: "3.9"
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: job-tracker-dashboard:local
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env.local
+    restart: unless-stopped
+
+  sync-worker:
+    build:
+      context: ./services/sync-worker
+      dockerfile: Dockerfile
+    image: job-tracker-sync-worker:local
+    ports:
+      - "4000:4000"
+    environment:
+      APP_SYNC_URL: http://web:3000/api/sync
+      SYNC_WEBHOOK_SECRET: ${SYNC_WEBHOOK_SECRET}
+      PORT: 4000
+    depends_on:
+      - web
+    restart: unless-stopped

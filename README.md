@@ -16,6 +16,45 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+## Environment
+
+Copy `.env.example` to `.env.local` and fill in your values:
+
+```bash
+cp .env.example .env.local
+```
+
+## Docker
+
+Build and run the app plus sync worker:
+
+```bash
+docker compose up --build
+```
+
+- App: [http://localhost:3000](http://localhost:3000)
+- Sync worker health: [http://localhost:4000/healthz](http://localhost:4000/healthz)
+- Trigger sync manually:
+
+```bash
+curl -X POST http://localhost:4000/trigger-sync
+```
+
+## CI/CD
+
+- CI workflow (`.github/workflows/ci.yml`) runs lint + build on PRs and pushes to `main`.
+- CD workflow (`.github/workflows/cd.yml`) runs on:
+  - `develop` -> tags image as `staging`
+  - `main` -> tags image as `latest`
+- CD can also be triggered manually (`workflow_dispatch`) with environment choice:
+  - `staging` -> tags image as `staging`
+  - `production` -> tags image as `latest`
+- CD always pushes image tags to GHCR (`ghcr.io/<owner>/<repo>`).
+- Optional deploy webhook step uses these GitHub Actions secrets:
+  - `DEPLOY_WEBHOOK_URL_STAGING` for `develop`
+  - `DEPLOY_WEBHOOK_URL_PROD` for `main`
+- If the corresponding webhook secret is missing, deploy is skipped safely.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
