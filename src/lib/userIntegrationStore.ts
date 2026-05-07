@@ -68,6 +68,8 @@ export async function upsertWatchMetadata(
 ): Promise<UserIntegrationRecord | null> {
   if (!hasDatabaseConfig()) return null;
   await ensureTable();
+  const normalizedEmail = input.email.trim().toLowerCase();
+  if (!normalizedEmail) return null;
 
   const historyId = input.gmailHistoryId ?? null;
   const expirationIso = input.gmailWatchExpiration
@@ -80,7 +82,7 @@ export async function upsertWatchMetadata(
       gmail_history_id,
       gmail_watch_expiration
     )
-    VALUES (${input.email}, ${historyId}, ${expirationIso})
+    VALUES (${normalizedEmail}, ${historyId}, ${expirationIso})
     ON CONFLICT (email) DO UPDATE SET
       gmail_history_id = EXCLUDED.gmail_history_id,
       gmail_watch_expiration = EXCLUDED.gmail_watch_expiration,

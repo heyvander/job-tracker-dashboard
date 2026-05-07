@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { signIn, signOut, useSession } from "next-auth/react";
+import { signOut, useSession } from "next-auth/react";
+import { useRouter } from "next/navigation";
 import { JourneySankey } from "@/components/JourneySankey";
 type Job = {
   rowNumber: number;
@@ -416,6 +417,7 @@ function filterAcyclicWeightedEdges(weights: Map<string, number>): Map<string, n
 
 export default function Home() {
   const PAGE_SIZE = 50;
+  const router = useRouter();
   const { data: session, status } = useSession();
   const [syncLoading, setSyncLoading] = useState(false);
   const [watchLoading, setWatchLoading] = useState(false);
@@ -625,6 +627,11 @@ export default function Home() {
     }
   }, [status]);
 
+  useEffect(() => {
+    if (status !== "unauthenticated") return;
+    router.replace("/signin");
+  }, [status, router]);
+
   async function runSync() {
     setSyncLoading(true);
     setSyncMessage("");
@@ -831,14 +838,7 @@ export default function Home() {
           Sign in with Google to allow Gmail and Sheets sync.
         </p>
 
-        {!session ? (
-          <button
-            onClick={() => signIn("google")}
-            className="mt-6 rounded-full bg-zinc-900 px-5 py-2 text-sm font-medium text-white transition hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-          >
-            Sign in with Google
-          </button>
-        ) : (
+        {!session ? null : (
           <div className="mt-6 space-y-4">
             <p className="text-sm text-zinc-700 dark:text-zinc-300">
               Signed in as{" "}

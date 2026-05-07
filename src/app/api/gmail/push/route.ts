@@ -30,7 +30,18 @@ export async function POST(request: NextRequest) {
   const persistenceEnabled = integrationPersistenceEnabled();
 
   // In multi-user mode, only sync known users.
-  if (persistenceEnabled && emailAddress) {
+  if (persistenceEnabled) {
+    if (!emailAddress) {
+      return NextResponse.json(
+        {
+          ok: true,
+          skipped: true,
+          reason: "Push payload missing emailAddress in multi-user mode",
+          payload,
+        },
+        { status: 202 },
+      );
+    }
     const existing = await getIntegrationByEmail(emailAddress);
     if (!existing) {
       return NextResponse.json(
