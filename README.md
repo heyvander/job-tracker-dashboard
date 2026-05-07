@@ -59,6 +59,16 @@ curl -X POST http://localhost:4000/trigger-sync
   - `DEPLOY_WEBHOOK_URL_PROD` for `main`
 - If the corresponding webhook secret is missing, deploy is skipped safely.
 
+## Integration status
+
+Use this endpoint while signed in to verify DB-backed integration state:
+
+```bash
+GET /api/integration/status
+```
+
+It returns safe diagnostics only (e.g. whether tokens exist, sheet id/url, history/watch state), and does not return raw token values.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.

@@ -1,4 +1,5 @@
 import { authOptions } from "@/lib/auth";
+import { ensureUserSheet } from "@/lib/userSheet";
 import { google } from "googleapis";
 import { getServerSession } from "next-auth";
 import { getToken } from "next-auth/jwt";
@@ -127,14 +128,22 @@ export async function GET(request: NextRequest) {
     secret: process.env.NEXTAUTH_SECRET,
   });
   const accessToken = (token?.accessToken as string | undefined) ?? session?.accessToken;
-  const sheetIdRaw = process.env.GOOGLE_SHEETS_ID;
+  const sessionEmail = session?.user?.email?.trim().toLowerCase() ?? "";
+  const tokenEmail = typeof token?.email === "string" ? token.email.trim().toLowerCase() : "";
+  const resolvedEmail = sessionEmail || tokenEmail;
   const configuredSheetName = process.env.GOOGLE_SHEETS_TAB;
 
   if (!accessToken) {
     return NextResponse.json({ error: "Not authenticated with Google" }, { status: 401 });
   }
+  const ensuredSheet = await ensureUserSheet({
+    accessToken,
+    email: resolvedEmail,
+    defaultSheetName: configuredSheetName,
+  });
+  const sheetIdRaw = ensuredSheet.sheetId ?? process.env.GOOGLE_SHEETS_ID;
   if (!sheetIdRaw) {
-    return NextResponse.json({ error: "Missing GOOGLE_SHEETS_ID" }, { status: 500 });
+    return NextResponse.json({ error: "Missing sheet id for this user" }, { status: 500 });
   }
 
   const auth = new google.auth.OAuth2();
@@ -255,14 +264,22 @@ export async function POST(request: NextRequest) {
     secret: process.env.NEXTAUTH_SECRET,
   });
   const accessToken = (token?.accessToken as string | undefined) ?? session?.accessToken;
-  const sheetIdRaw = process.env.GOOGLE_SHEETS_ID;
+  const sessionEmail = session?.user?.email?.trim().toLowerCase() ?? "";
+  const tokenEmail = typeof token?.email === "string" ? token.email.trim().toLowerCase() : "";
+  const resolvedEmail = sessionEmail || tokenEmail;
   const configuredSheetName = process.env.GOOGLE_SHEETS_TAB;
 
   if (!accessToken) {
     return NextResponse.json({ error: "Not authenticated with Google" }, { status: 401 });
   }
+  const ensuredSheet = await ensureUserSheet({
+    accessToken,
+    email: resolvedEmail,
+    defaultSheetName: configuredSheetName,
+  });
+  const sheetIdRaw = ensuredSheet.sheetId ?? process.env.GOOGLE_SHEETS_ID;
   if (!sheetIdRaw) {
-    return NextResponse.json({ error: "Missing GOOGLE_SHEETS_ID" }, { status: 500 });
+    return NextResponse.json({ error: "Missing sheet id for this user" }, { status: 500 });
   }
 
   const body = (await request.json()) as CreateBody;
@@ -369,14 +386,22 @@ export async function PUT(request: NextRequest) {
     secret: process.env.NEXTAUTH_SECRET,
   });
   const accessToken = (token?.accessToken as string | undefined) ?? session?.accessToken;
-  const sheetIdRaw = process.env.GOOGLE_SHEETS_ID;
+  const sessionEmail = session?.user?.email?.trim().toLowerCase() ?? "";
+  const tokenEmail = typeof token?.email === "string" ? token.email.trim().toLowerCase() : "";
+  const resolvedEmail = sessionEmail || tokenEmail;
   const configuredSheetName = process.env.GOOGLE_SHEETS_TAB;
 
   if (!accessToken) {
     return NextResponse.json({ error: "Not authenticated with Google" }, { status: 401 });
   }
+  const ensuredSheet = await ensureUserSheet({
+    accessToken,
+    email: resolvedEmail,
+    defaultSheetName: configuredSheetName,
+  });
+  const sheetIdRaw = ensuredSheet.sheetId ?? process.env.GOOGLE_SHEETS_ID;
   if (!sheetIdRaw) {
-    return NextResponse.json({ error: "Missing GOOGLE_SHEETS_ID" }, { status: 500 });
+    return NextResponse.json({ error: "Missing sheet id for this user" }, { status: 500 });
   }
 
   const body = (await request.json()) as UpdateBody;

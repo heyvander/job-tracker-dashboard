@@ -421,7 +421,6 @@ export default function Home() {
   const { data: session, status } = useSession();
   const [syncLoading, setSyncLoading] = useState(false);
   const [watchLoading, setWatchLoading] = useState(false);
-  const [tokenLoading, setTokenLoading] = useState(false);
   const [jobsLoading, setJobsLoading] = useState(false);
   const [syncMessage, setSyncMessage] = useState<string>("");
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -438,7 +437,6 @@ export default function Home() {
   const [addStep, setAddStep] = useState<"link" | "confirm">("link");
   const [addLoading, setAddLoading] = useState(false);
   const [addMessage, setAddMessage] = useState("");
-  const [refreshTokenReveal, setRefreshTokenReveal] = useState("");
   const [newJobDraft, setNewJobDraft] = useState<NewJobDraft>({
     link: "",
     company: "",
@@ -690,26 +688,6 @@ export default function Home() {
     }
   }
 
-  async function revealRefreshToken() {
-    setTokenLoading(true);
-    setSyncMessage("");
-    setRefreshTokenReveal("");
-    try {
-      const response = await fetch("/api/auth/refresh-token");
-      const data = (await response.json()) as { error?: string; refreshToken?: string };
-      if (!response.ok || !data.refreshToken) {
-        setSyncMessage(data.error ?? "Could not fetch refresh token.");
-        return;
-      }
-      setRefreshTokenReveal(data.refreshToken);
-      setSyncMessage("Refresh token loaded below. Copy into SYNC_REFRESH_TOKEN.");
-    } catch {
-      setSyncMessage("Could not fetch refresh token.");
-    } finally {
-      setTokenLoading(false);
-    }
-  }
-
   async function saveJobEdits() {
     if (!jobDraft) return;
     setSaveLoading(true);
@@ -882,13 +860,6 @@ export default function Home() {
                 {watchLoading ? "Enabling..." : "Enable Realtime Watch"}
               </button>
               <button
-                onClick={revealRefreshToken}
-                disabled={tokenLoading}
-                className="rounded-full bg-violet-600 px-5 py-2 text-sm font-medium text-white transition hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {tokenLoading ? "Loading token..." : "Reveal Refresh Token"}
-              </button>
-              <button
                 onClick={loadJobs}
                 disabled={jobsLoading}
                 className="rounded-full border border-zinc-300 px-5 py-2 text-sm font-medium text-zinc-900 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-900"
@@ -898,27 +869,6 @@ export default function Home() {
             </div>
             {syncMessage ? (
               <p className="text-sm text-zinc-700 dark:text-zinc-300">{syncMessage}</p>
-            ) : null}
-            {refreshTokenReveal ? (
-              <div className="rounded-lg border border-violet-200 bg-violet-50 p-3 dark:border-violet-900 dark:bg-violet-950/40">
-                <p className="mb-2 text-xs font-medium uppercase tracking-wide text-violet-700 dark:text-violet-300">
-                  SYNC_REFRESH_TOKEN
-                </p>
-                <div className="flex items-center gap-2">
-                  <input
-                    readOnly
-                    value={refreshTokenReveal}
-                    className="w-full rounded border border-violet-300 bg-white px-2 py-1 text-xs text-zinc-900 dark:border-violet-700 dark:bg-zinc-900 dark:text-zinc-100"
-                  />
-                  <button
-                    type="button"
-                    className="rounded border border-violet-300 px-2 py-1 text-xs text-violet-800 dark:border-violet-700 dark:text-violet-200"
-                    onClick={() => void navigator.clipboard.writeText(refreshTokenReveal)}
-                  >
-                    Copy
-                  </button>
-                </div>
-              </div>
             ) : null}
             <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-4">
               <div className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">

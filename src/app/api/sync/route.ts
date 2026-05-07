@@ -1,5 +1,6 @@
 import { authOptions } from "@/lib/auth";
-import { getIntegrationByEmail, integrationPersistenceEnabled } from "@/lib/userIntegrationStore";
+import { ensureUserSheet } from "@/lib/userSheet";
+import { getIntegrationByEmail, integrationPersistenceEnabled, updateSyncState } from "@/lib/userIntegrationStore";
 import { google } from "googleapis";
 import { getServerSession } from "next-auth";
 import { getToken } from "next-auth/jwt";
@@ -283,17 +284,17 @@ export async function POST(request: NextRequest) {
   const sessionEmail = session?.user?.email?.trim().toLowerCase() ?? "";
   const tokenEmail = typeof token?.email === "string" ? token.email.trim().toLowerCase() : "";
   const resolvedEmail = internalUserEmail || sessionEmail || tokenEmail;
+  const integration =
+    persistenceEnabled && resolvedEmail ? await getIntegrationByEmail(resolvedEmail) : null;
 
   let accessToken = (token?.accessToken as string | undefined) ?? session?.accessToken;
   if (!accessToken && isInternalPush) {
-    const refreshToken = process.env.SYNC_REFRESH_TOKEN;
+    const refreshToken = integration?.googleRefreshToken ?? null;
     if (refreshToken) {
       accessToken = (await accessTokenFromRefreshToken(refreshToken)) ?? undefined;
     }
   }
-  const integration =
-    persistenceEnabled && resolvedEmail ? await getIntegrationByEmail(resolvedEmail) : null;
-  const sheetIdRaw = integration?.sheetId ?? process.env.GOOGLE_SHEETS_ID;
+  let ensuredSheetId: string | null = null;
   const configuredSheetName = process.env.GOOGLE_SHEETS_TAB;
 
   if (!accessToken) {
@@ -306,12 +307,21 @@ export async function POST(request: NextRequest) {
           hasJwtToken: Boolean(token),
           hasJwtAccessToken: Boolean(token?.accessToken),
           isInternalPush,
-          hasSyncRefreshToken: Boolean(process.env.SYNC_REFRESH_TOKEN),
+          hasStoredIntegration: Boolean(integration),
+          hasStoredRefreshToken: Boolean(integration?.googleRefreshToken),
         },
       },
       { status: 401 },
     );
   }
+
+  const ensuredSheet = await ensureUserSheet({
+    accessToken,
+    email: resolvedEmail,
+    defaultSheetName: process.env.GOOGLE_SHEETS_TAB,
+  });
+  ensuredSheetId = ensuredSheet.sheetId;
+  const sheetIdRaw = ensuredSheetId ?? integration?.sheetId ?? process.env.GOOGLE_SHEETS_ID;
 
   if (!sheetIdRaw) {
     return NextResponse.json(
@@ -334,6 +344,7 @@ export async function POST(request: NextRequest) {
 
   const gmail = google.gmail({ version: "v1", auth });
   const sheets = google.sheets({ version: "v4", auth });
+  let nextHistoryId: string | null = integration?.gmailHistoryId ?? null;
 
   let sheetName = configuredSheetName;
   if (!sheetName) {
@@ -401,17 +412,49 @@ export async function POST(request: NextRequest) {
     });
   });
 
-  const gmailList = await gmail.users.messages.list({
-    userId: "me",
-    maxResults: 50,
-    q: 'newer_than:180d (subject:(application OR interview OR assessment OR offer OR update) OR from:(greenhouse.io OR lever.co OR workday.com OR smartrecruiters.com OR taleo.net OR icims.com))',
-  });
-
-  const messageIds = gmailList.data.messages?.map((message) => message.id).filter(Boolean) as
-    | string[]
-    | undefined;
+  let messageIds: string[] | undefined;
+  if (integration?.gmailHistoryId) {
+    try {
+      const history = await gmail.users.history.list({
+        userId: "me",
+        startHistoryId: integration.gmailHistoryId,
+        historyTypes: ["messageAdded"],
+        maxResults: 200,
+      });
+      nextHistoryId = history.data.historyId ?? nextHistoryId;
+      const collected = new Set<string>();
+      for (const row of history.data.history ?? []) {
+        for (const added of row.messagesAdded ?? []) {
+          if (added.message?.id) collected.add(added.message.id);
+        }
+      }
+      messageIds = [...collected];
+    } catch (error) {
+      const status = (error as { code?: number; response?: { status?: number } })?.response?.status ??
+        (error as { code?: number })?.code;
+      if (status !== 404) throw error;
+      // Start history id expired or invalid; fall back to full mailbox query.
+    }
+  }
+  if (!messageIds) {
+    const gmailList = await gmail.users.messages.list({
+      userId: "me",
+      maxResults: 50,
+      q: 'newer_than:180d (subject:(application OR interview OR assessment OR offer OR update) OR from:(greenhouse.io OR lever.co OR workday.com OR smartrecruiters.com OR taleo.net OR icims.com))',
+    });
+    messageIds = gmailList.data.messages?.map((message) => message.id).filter(Boolean) as
+      | string[]
+      | undefined;
+  }
 
   if (!messageIds?.length) {
+    if (persistenceEnabled && resolvedEmail) {
+      await updateSyncState({
+        email: resolvedEmail,
+        gmailHistoryId: nextHistoryId,
+        lastSyncStatus: "ok",
+      });
+    }
     return NextResponse.json({ updated: 0, scanned: 0, details: [] });
   }
 
@@ -429,6 +472,16 @@ export async function POST(request: NextRequest) {
       format: "metadata",
       metadataHeaders: ["Subject", "From", "Date"],
     });
+    const messageHistoryId = message.data.historyId;
+    if (messageHistoryId) {
+      try {
+        const current = BigInt(nextHistoryId ?? "0");
+        const candidate = BigInt(messageHistoryId);
+        if (candidate > current) nextHistoryId = messageHistoryId;
+      } catch {
+        nextHistoryId = messageHistoryId;
+      }
+    }
 
     const headers = message.data.payload?.headers;
     const subject = getHeaderValue(headers, "Subject");
@@ -510,6 +563,14 @@ export async function POST(request: NextRequest) {
     matched.status = detectedStatus;
     matched.journey = nextJourney;
     matched.rowValues = rowValues;
+  }
+
+  if (persistenceEnabled && resolvedEmail) {
+    await updateSyncState({
+      email: resolvedEmail,
+      gmailHistoryId: nextHistoryId,
+      lastSyncStatus: "ok",
+    });
   }
 
   return NextResponse.json({

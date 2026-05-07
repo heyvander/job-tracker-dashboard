@@ -1,6 +1,7 @@
 import type { NextAuthOptions } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
 import type { JWT } from "next-auth/jwt";
+import { upsertOAuthTokens } from "@/lib/userIntegrationStore";
 
 type TokenWithOAuth = JWT & {
   accessToken?: string;
@@ -50,6 +51,21 @@ async function refreshAccessToken(token: TokenWithOAuth): Promise<TokenWithOAuth
   }
 }
 
+async function persistTokens(token: TokenWithOAuth): Promise<void> {
+  try {
+    const email = typeof token.email === "string" ? token.email.trim().toLowerCase() : "";
+    if (!email) return;
+    await upsertOAuthTokens({
+      email,
+      accessToken: token.accessToken ?? null,
+      refreshToken: token.refreshToken ?? null,
+      accessTokenExpiresAt: token.accessTokenExpires ?? null,
+    });
+  } catch {
+    // Keep auth flow resilient even if persistence is unavailable.
+  }
+}
+
 export const authOptions: NextAuthOptions = {
   session: {
     strategy: "jwt",
@@ -82,6 +98,7 @@ export const authOptions: NextAuthOptions = {
           ? account.expires_at * 1000
           : undefined;
         nextToken.refreshToken = account.refresh_token ?? nextToken.refreshToken;
+        await persistTokens(nextToken);
         return nextToken;
       }
 
@@ -94,9 +111,12 @@ export const authOptions: NextAuthOptions = {
       }
 
       if (nextToken.refreshToken) {
-        return refreshAccessToken(nextToken);
+        const refreshedToken = await refreshAccessToken(nextToken);
+        await persistTokens(refreshedToken);
+        return refreshedToken;
       }
 
+      await persistTokens(nextToken);
       return nextToken;
     },
     async session({ session, token }) {
