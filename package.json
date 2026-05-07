@@ -11,6 +11,7 @@
   "dependencies": {
     "@nivo/core": "^0.99.0",
     "@nivo/sankey": "^0.99.0",
+    "@vercel/postgres": "^0.10.0",
     "googleapis": "^171.4.0",
     "next": "16.2.4",
     "next-auth": "^4.24.14",

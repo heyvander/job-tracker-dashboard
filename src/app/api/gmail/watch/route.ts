@@ -1,4 +1,5 @@
 import { authOptions } from "@/lib/auth";
+import { integrationPersistenceEnabled, upsertWatchMetadata } from "@/lib/userIntegrationStore";
 import { google } from "googleapis";
 import { getServerSession } from "next-auth";
 import { getToken } from "next-auth/jwt";
@@ -11,10 +12,14 @@ export async function POST(request: NextRequest) {
     secret: process.env.NEXTAUTH_SECRET,
   });
   const accessToken = (token?.accessToken as string | undefined) ?? session?.accessToken;
+  const email = session?.user?.email ?? token?.email;
   const topicName = process.env.GMAIL_PUBSUB_TOPIC;
 
   if (!accessToken) {
     return NextResponse.json({ error: "Not authenticated with Google" }, { status: 401 });
+  }
+  if (!email) {
+    return NextResponse.json({ error: "Missing user email in session token" }, { status: 400 });
   }
   if (!topicName) {
     return NextResponse.json(
@@ -36,9 +41,18 @@ export async function POST(request: NextRequest) {
     },
   });
 
+  const persisted = await upsertWatchMetadata({
+    email,
+    gmailHistoryId: result.data.historyId,
+    gmailWatchExpiration: result.data.expiration,
+  });
+
   return NextResponse.json({
     ok: true,
+    email,
     historyId: result.data.historyId,
     expiration: result.data.expiration,
+    integrationPersisted: Boolean(persisted),
+    integrationPersistenceEnabled: integrationPersistenceEnabled(),
   });
 }
