@@ -1,4 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
+import {
+  getIntegrationByEmail,
+  integrationPersistenceEnabled,
+  updateHistoryFromPush,
+} from "@/lib/userIntegrationStore";
 
 type PubSubEnvelope = {
   message?: {
@@ -21,6 +26,28 @@ export async function POST(request: NextRequest) {
     ? Buffer.from(body.message.data, "base64").toString("utf8")
     : "{}";
   const payload = JSON.parse(payloadRaw) as { emailAddress?: string; historyId?: string };
+  const emailAddress = payload.emailAddress?.trim().toLowerCase() ?? "";
+  const persistenceEnabled = integrationPersistenceEnabled();
+
+  // In multi-user mode, only sync known users.
+  if (persistenceEnabled && emailAddress) {
+    const existing = await getIntegrationByEmail(emailAddress);
+    if (!existing) {
+      return NextResponse.json(
+        {
+          ok: true,
+          skipped: true,
+          reason: "No user integration found for push email",
+          payload,
+        },
+        { status: 202 },
+      );
+    }
+    await updateHistoryFromPush({
+      email: emailAddress,
+      gmailHistoryId: payload.historyId,
+    });
+  }
 
   const baseUrl =
     process.env.APP_BASE_URL ??
@@ -31,6 +58,7 @@ export async function POST(request: NextRequest) {
     method: "POST",
     headers: {
       "x-sync-webhook-secret": expectedSecret,
+      ...(emailAddress ? { "x-sync-user-email": emailAddress } : {}),
     },
   });
 
@@ -45,6 +73,7 @@ export async function POST(request: NextRequest) {
   const syncResult = await syncResponse.json();
   return NextResponse.json({
     ok: true,
+    persistenceEnabled,
     payload,
     sync: syncResult,
   });

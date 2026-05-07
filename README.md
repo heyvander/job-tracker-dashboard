@@ -24,6 +24,8 @@ Copy `.env.example` to `.env.local` and fill in your values:
 cp .env.example .env.local
 ```
 
+For multi-user mode, set `POSTGRES_URL` so the app can persist per-user Gmail watch metadata and integration state.
+
 ## Docker
 
 Build and run the app plus sync worker:

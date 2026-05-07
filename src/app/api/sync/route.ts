@@ -1,4 +1,5 @@
 import { authOptions } from "@/lib/auth";
+import { getIntegrationByEmail, integrationPersistenceEnabled } from "@/lib/userIntegrationStore";
 import { google } from "googleapis";
 import { getServerSession } from "next-auth";
 import { getToken } from "next-auth/jwt";
@@ -275,8 +276,13 @@ export async function POST(request: NextRequest) {
     secret: process.env.NEXTAUTH_SECRET,
   });
   const internalSecret = request.headers.get("x-sync-webhook-secret");
+  const internalUserEmail = request.headers.get("x-sync-user-email")?.trim().toLowerCase() ?? "";
   const expectedSecret = process.env.SYNC_WEBHOOK_SECRET;
   const isInternalPush = Boolean(expectedSecret && internalSecret === expectedSecret);
+  const persistenceEnabled = integrationPersistenceEnabled();
+  const sessionEmail = session?.user?.email?.trim().toLowerCase() ?? "";
+  const tokenEmail = typeof token?.email === "string" ? token.email.trim().toLowerCase() : "";
+  const resolvedEmail = internalUserEmail || sessionEmail || tokenEmail;
 
   let accessToken = (token?.accessToken as string | undefined) ?? session?.accessToken;
   if (!accessToken && isInternalPush) {
@@ -285,7 +291,9 @@ export async function POST(request: NextRequest) {
       accessToken = (await accessTokenFromRefreshToken(refreshToken)) ?? undefined;
     }
   }
-  const sheetIdRaw = process.env.GOOGLE_SHEETS_ID;
+  const integration =
+    persistenceEnabled && resolvedEmail ? await getIntegrationByEmail(resolvedEmail) : null;
+  const sheetIdRaw = integration?.sheetId ?? process.env.GOOGLE_SHEETS_ID;
   const configuredSheetName = process.env.GOOGLE_SHEETS_TAB;
 
   if (!accessToken) {
@@ -306,7 +314,18 @@ export async function POST(request: NextRequest) {
   }
 
   if (!sheetIdRaw) {
-    return NextResponse.json({ error: "Missing GOOGLE_SHEETS_ID" }, { status: 500 });
+    return NextResponse.json(
+      {
+        error: "Missing sheet id for user (and GOOGLE_SHEETS_ID fallback not configured)",
+        diagnostics: {
+          resolvedEmail: resolvedEmail || null,
+          persistenceEnabled,
+          hasIntegrationSheetId: Boolean(integration?.sheetId),
+          hasGlobalSheetId: Boolean(process.env.GOOGLE_SHEETS_ID),
+        },
+      },
+      { status: 500 },
+    );
   }
   const sheetId = resolveSpreadsheetId(sheetIdRaw);
 
