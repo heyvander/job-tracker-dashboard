@@ -7,6 +7,8 @@ export type TransitionRow = { from: string; to: string; count: number };
 
 type Props = {
   rows: TransitionRow[];
+  /** Jobs touching each stage (same semantics as node click inspect). */
+  nodeJobCounts?: Record<string, number>;
   stageRank: (name: string) => number;
   stageColors: Record<string, string>;
   /** Tap a bundle (stage) — list jobs touching that stage. */
@@ -39,6 +41,7 @@ function usePrefersDark() {
 
 export function JourneySankey({
   rows,
+  nodeJobCounts,
   stageRank,
   stageColors,
   onInspectNode,
@@ -108,10 +111,7 @@ export function JourneySankey({
 
   const labelTextColor = prefersDark ? "#cbd5e1" : "#52525b";
 
-  const handleInteractiveClick = (
-    datum: unknown,
-    _event: unknown,
-  ) => {
+  const handleInteractiveClick = (datum: unknown) => {
     if (!onInspectNode && !onInspectLink) return;
     if (
       datum &&
@@ -165,6 +165,11 @@ export function JourneySankey({
         linkBlendMode="normal"
         enableLinkGradient
         enableLabels
+        label={(node) => {
+          const id = String(node.id);
+          const n = nodeJobCounts?.[id];
+          return n !== undefined ? `${id} (${n})` : id;
+        }}
         labelPosition="outside"
         labelOrientation="horizontal"
         labelPadding={10}

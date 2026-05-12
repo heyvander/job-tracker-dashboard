@@ -53,6 +53,61 @@ function todayIsoDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+function toYyyyMmDdLocal(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/**
+ * Normalize sheet / UI dates to ISO yyyy-mm-dd (calendar date in local time).
+ * Slash dates are interpreted as US-style month/day/year (matches Google Sheets default).
+ */
+function parseFlexibleDateToIso(input: string): string | null {
+  const s = input.trim();
+  if (!s) return null;
+
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (iso) {
+    const y = Number(iso[1]);
+    const m = Number(iso[2]);
+    const d = Number(iso[3]);
+    const dt = new Date(y, m - 1, d);
+    if (dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d) {
+      return `${iso[1]}-${iso[2]}-${iso[3]}`;
+    }
+  }
+
+  const slash = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
+  if (slash) {
+    const month = Number(slash[1]);
+    const day = Number(slash[2]);
+    const year = Number(slash[3]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const dt = new Date(year, month - 1, day);
+      if (dt.getFullYear() === year && dt.getMonth() === month - 1 && dt.getDate() === day) {
+        return `${year}-${pad2(month)}-${pad2(day)}`;
+      }
+    }
+  }
+
+  const ms = Date.parse(s);
+  if (!Number.isNaN(ms)) {
+    const dt = new Date(ms);
+    if (!Number.isNaN(dt.getTime())) return toYyyyMmDdLocal(dt);
+  }
+
+  return null;
+}
+
+function normalizeDateField(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return parseFlexibleDateToIso(trimmed) ?? trimmed;
+}
+
 function cleanText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -221,16 +276,20 @@ export async function GET(request: NextRequest) {
     );
   }
 
-  const jobs = rows.slice(headerRowIndex + 1).map((row, idx) => ({
-    rowNumber: headerRowIndex + 2 + idx,
-    company: row[col.company] ?? "",
-    jobTitle: row[col.jobTitle] ?? "",
-    link: row[col.link] ?? "",
-    dateApplied: row[col.dateApplied] ?? "",
-    status: row[col.status] ?? "",
-    followUpDate: row[col.followUpDate] ?? "",
-    journey: col.journey >= 0 ? row[col.journey] ?? "" : "",
-  }));
+  const jobs = rows.slice(headerRowIndex + 1).map((row, idx) => {
+    const rawDateApplied = String(row[col.dateApplied] ?? "").trim();
+    const rawFollowUp = String(row[col.followUpDate] ?? "").trim();
+    return {
+      rowNumber: headerRowIndex + 2 + idx,
+      company: row[col.company] ?? "",
+      jobTitle: row[col.jobTitle] ?? "",
+      link: row[col.link] ?? "",
+      dateApplied: normalizeDateField(rawDateApplied) || rawDateApplied,
+      status: row[col.status] ?? "",
+      followUpDate: rawFollowUp ? normalizeDateField(rawFollowUp) || rawFollowUp : "",
+      journey: col.journey >= 0 ? row[col.journey] ?? "" : "",
+    };
+  });
 
   return NextResponse.json({ jobs });
 }
@@ -332,9 +391,9 @@ export async function POST(request: NextRequest) {
   const inferred = await inferJobFromLink(link);
   const company = body.company?.trim() || inferred.company;
   const jobTitle = body.jobTitle?.trim() || inferred.jobTitle;
-  const dateApplied = body.dateApplied?.trim() || todayIsoDate();
+  const dateApplied = normalizeDateField(body.dateApplied?.trim() || todayIsoDate());
   const status = body.status?.trim() || "Applied";
-  const followUpDate = body.followUpDate?.trim() || "";
+  const followUpDate = body.followUpDate?.trim() ? normalizeDateField(body.followUpDate.trim()) : "";
   const journey = body.journey?.trim() || "Applied";
 
   if (preview) {
@@ -366,7 +425,7 @@ export async function POST(request: NextRequest) {
   await sheets.spreadsheets.values.append({
     spreadsheetId,
     range: `${sheetName}!A:Z`,
-    valueInputOption: "USER_ENTERED",
+    valueInputOption: "RAW",
     insertDataOption: "INSERT_ROWS",
     requestBody: {
       values: [row],
@@ -459,9 +518,9 @@ export async function PUT(request: NextRequest) {
     company: body.company ?? "",
     jobTitle: body.jobTitle ?? "",
     link: body.link ?? "",
-    dateApplied: body.dateApplied ?? "",
+    dateApplied: normalizeDateField(body.dateApplied ?? ""),
     status: body.status ?? "",
-    followUpDate: body.followUpDate ?? "",
+    followUpDate: body.followUpDate?.trim() ? normalizeDateField(body.followUpDate ?? "") : "",
     journey: body.journey ?? "",
   };
 
@@ -488,9 +547,103 @@ export async function PUT(request: NextRequest) {
   await sheets.spreadsheets.values.update({
     spreadsheetId,
     range: `${sheetName}!A${rowNumber}:Z${rowNumber}`,
-    valueInputOption: "USER_ENTERED",
+    valueInputOption: "RAW",
     requestBody: {
       values: [finalRow],
+    },
+  });
+
+  return NextResponse.json({ ok: true });
+}
+
+type DeleteBody = {
+  rowNumber?: number;
+};
+
+export async function DELETE(request: NextRequest) {
+  const session = await getServerSession(authOptions);
+  const token = await getToken({
+    req: request,
+    secret: process.env.NEXTAUTH_SECRET,
+  });
+  const accessToken = (token?.accessToken as string | undefined) ?? session?.accessToken;
+  const sessionEmail = session?.user?.email?.trim().toLowerCase() ?? "";
+  const tokenEmail = typeof token?.email === "string" ? token.email.trim().toLowerCase() : "";
+  const resolvedEmail = sessionEmail || tokenEmail;
+  const configuredSheetName = process.env.GOOGLE_SHEETS_TAB;
+
+  if (!accessToken) {
+    return NextResponse.json({ error: "Not authenticated with Google" }, { status: 401 });
+  }
+  const ensuredSheet = await ensureUserSheet({
+    accessToken,
+    email: resolvedEmail,
+    defaultSheetName: configuredSheetName,
+  });
+  const sheetIdRaw = ensuredSheet.sheetId ?? process.env.GOOGLE_SHEETS_ID;
+  if (!sheetIdRaw) {
+    return NextResponse.json({ error: "Missing sheet id for this user" }, { status: 500 });
+  }
+
+  const body = (await request.json()) as DeleteBody;
+  const rowNumber = Number(body.rowNumber);
+  if (!Number.isFinite(rowNumber) || rowNumber < 2) {
+    return NextResponse.json({ error: "Invalid rowNumber" }, { status: 400 });
+  }
+
+  const auth = new google.auth.OAuth2();
+  auth.setCredentials({ access_token: accessToken });
+  const sheets = google.sheets({ version: "v4", auth });
+  const spreadsheetId = resolveSpreadsheetId(sheetIdRaw);
+
+  let sheetName = configuredSheetName;
+  if (!sheetName) {
+    const meta = await sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: "sheets(properties(title))",
+    });
+    sheetName = meta.data.sheets?.[0]?.properties?.title ?? "Sheet1";
+  }
+
+  const sheet = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `${sheetName}!A:Z`,
+  });
+
+  const rows = sheet.data.values ?? [];
+  const headerRowIndex = findHeaderRowIndex(rows as string[][]);
+  if (headerRowIndex < 0) {
+    return NextResponse.json({ error: "Could not find header row." }, { status: 400 });
+  }
+  if (rowNumber <= headerRowIndex + 1) {
+    return NextResponse.json({ error: "Cannot delete header row." }, { status: 400 });
+  }
+
+  const sheetMeta = await sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets(properties(sheetId,title))",
+  });
+  const sheetTab = sheetMeta.data.sheets?.find((s) => s.properties?.title === sheetName);
+  const numericSheetId = sheetTab?.properties?.sheetId;
+  if (numericSheetId === undefined || numericSheetId === null) {
+    return NextResponse.json({ error: "Could not resolve sheet tab id." }, { status: 500 });
+  }
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [
+        {
+          deleteDimension: {
+            range: {
+              sheetId: numericSheetId,
+              dimension: "ROWS",
+              startIndex: rowNumber - 1,
+              endIndex: rowNumber,
+            },
+          },
+        },
+      ],
     },
   });
 

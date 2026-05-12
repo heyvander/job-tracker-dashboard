@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { signOut, useSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import { JourneySankey } from "@/components/JourneySankey";
@@ -34,6 +34,17 @@ type NewJobDraft = {
   status: string;
   followUpDate: string;
   journey: string;
+};
+
+type IntegrationStatusResponse = {
+  ok?: boolean;
+  persistenceEnabled?: boolean;
+  integration?: {
+    gmailWatchExpiration?: string | null;
+    lastSyncAt?: string | null;
+    lastSyncStatus?: string | null;
+    lastSyncError?: string | null;
+  } | null;
 };
 
 const STAGE_COLORS: Record<string, string> = {
@@ -419,10 +430,9 @@ export default function Home() {
   const PAGE_SIZE = 50;
   const router = useRouter();
   const { data: session, status } = useSession();
-  const [syncLoading, setSyncLoading] = useState(false);
-  const [watchLoading, setWatchLoading] = useState(false);
   const [jobsLoading, setJobsLoading] = useState(false);
   const [syncMessage, setSyncMessage] = useState<string>("");
+  const [integrationStatus, setIntegrationStatus] = useState<IntegrationStatusResponse | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [statusFilter, setStatusFilter] = useState("All");
   const [jobSearchQuery, setJobSearchQuery] = useState("");
@@ -432,6 +442,7 @@ export default function Home() {
   const [journeyDraftStages, setJourneyDraftStages] = useState<string[]>([]);
   const [journeyStageToAdd, setJourneyStageToAdd] = useState<string>(JOURNEY_STAGE_OPTIONS[0]);
   const [saveLoading, setSaveLoading] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [addStep, setAddStep] = useState<"link" | "confirm">("link");
@@ -450,6 +461,10 @@ export default function Home() {
     title: string;
     jobs: Job[];
   } | null>(null);
+  const lastSeenSyncAtRef = useRef<string | null>(null);
+  const watchInitializedRef = useRef(false);
+  const watchRenewInFlightRef = useRef(false);
+  const lastWatchRenewAttemptRef = useRef(0);
 
   useEffect(() => {
     const anyOpen = journeyModalJob || sankeyBrowse || addModalOpen;
@@ -598,10 +613,20 @@ export default function Home() {
         return a.to.localeCompare(b.to);
       });
 
-    return { rows };
+    const nodeIds = new Set<string>();
+    for (const r of rows) {
+      nodeIds.add(r.from);
+      nodeIds.add(r.to);
+    }
+    const nodeJobCounts: Record<string, number> = {};
+    for (const id of nodeIds) {
+      nodeJobCounts[id] = jobsForSankeyNode(jobs, id).length;
+    }
+
+    return { rows, nodeJobCounts };
   }, [jobs]);
 
-  async function loadJobs() {
+  const loadJobs = useCallback(async () => {
     setJobsLoading(true);
     try {
       const response = await fetch("/api/jobs");
@@ -616,77 +641,142 @@ export default function Home() {
     } finally {
       setJobsLoading(false);
     }
-  }
+  }, []);
+
+  const loadIntegrationStatus = useCallback(async () => {
+    try {
+      const response = await fetch("/api/integration/status");
+      const data = (await response.json()) as IntegrationStatusResponse;
+      if (!response.ok) {
+        setIntegrationStatus(null);
+        return;
+      }
+      setIntegrationStatus(data);
+    } catch {
+      setIntegrationStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    const currentLastSyncAt = integrationStatus?.integration?.lastSyncAt ?? null;
+    if (!currentLastSyncAt) return;
+    if (!lastSeenSyncAtRef.current) {
+      lastSeenSyncAtRef.current = currentLastSyncAt;
+      return;
+    }
+    if (lastSeenSyncAtRef.current === currentLastSyncAt) return;
+    lastSeenSyncAtRef.current = currentLastSyncAt;
+    void loadJobs();
+  }, [integrationStatus, loadJobs]);
 
   useEffect(() => {
     if (status === "authenticated") {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       void loadJobs();
+      void loadIntegrationStatus();
     }
-  }, [status]);
+  }, [status, loadJobs, loadIntegrationStatus]);
 
   useEffect(() => {
     if (status !== "unauthenticated") return;
     router.replace("/signin");
   }, [status, router]);
 
-  async function runSync() {
-    setSyncLoading(true);
-    setSyncMessage("");
-    try {
-      const response = await fetch("/api/sync", { method: "POST" });
-      const data = (await response.json()) as {
-        error?: string;
-        updated?: number;
-        scanned?: number;
-        diagnostics?: {
-          hasSession?: boolean;
-          hasSessionAccessToken?: boolean;
-          hasJwtToken?: boolean;
-          hasJwtAccessToken?: boolean;
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    const source = new EventSource("/api/events/sync");
+    const onSyncComplete = (event: Event) => {
+      const messageEvent = event as MessageEvent<string>;
+      try {
+        const payload = JSON.parse(messageEvent.data) as { scanned?: number; updated?: number };
+        setSyncMessage(
+          `Auto sync complete. Scanned ${payload.scanned ?? 0} emails and updated ${payload.updated ?? 0} row(s).`,
+        );
+      } catch {
+        setSyncMessage("Auto sync complete.");
+      }
+      void loadJobs();
+      void loadIntegrationStatus();
+    };
+    source.addEventListener("sync-complete", onSyncComplete);
+    source.onerror = () => {
+      // Network hiccups are expected; EventSource retries automatically.
+    };
+    return () => {
+      source.removeEventListener("sync-complete", onSyncComplete);
+      source.close();
+    };
+  }, [status, loadJobs, loadIntegrationStatus]);
+
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    const interval = window.setInterval(() => {
+      void loadIntegrationStatus();
+    }, 15000);
+    return () => window.clearInterval(interval);
+  }, [status, loadIntegrationStatus]);
+
+  const ensureRealtimeWatch = useCallback(
+    async (mode: "initial" | "renew") => {
+      if (watchRenewInFlightRef.current) return;
+      const now = Date.now();
+      if (now - lastWatchRenewAttemptRef.current < 5 * 60 * 1000) return;
+      watchRenewInFlightRef.current = true;
+      lastWatchRenewAttemptRef.current = now;
+      try {
+        const response = await fetch("/api/gmail/watch", { method: "POST" });
+        const data = (await response.json()) as {
+          error?: string;
         };
-      };
-
-      if (!response.ok) {
-        const diagnostics = data.diagnostics
-          ? ` (session:${data.diagnostics.hasSession ? "yes" : "no"}, sessionToken:${data.diagnostics.hasSessionAccessToken ? "yes" : "no"}, jwt:${data.diagnostics.hasJwtToken ? "yes" : "no"}, jwtToken:${data.diagnostics.hasJwtAccessToken ? "yes" : "no"})`
-          : "";
-        setSyncMessage(`${data.error ?? "Sync failed."}${diagnostics}`);
-        return;
+        if (!response.ok) {
+          setSyncMessage(
+            data.error ??
+              (mode === "initial"
+                ? "Failed to enable automatic Gmail watch."
+                : "Failed to refresh Gmail watch automatically."),
+          );
+          return;
+        }
+        await loadIntegrationStatus();
+      } catch {
+        setSyncMessage(
+          mode === "initial"
+            ? "Failed to enable automatic Gmail watch."
+            : "Failed to refresh Gmail watch automatically.",
+        );
+      } finally {
+        watchRenewInFlightRef.current = false;
       }
+    },
+    [loadIntegrationStatus],
+  );
 
-      setSyncMessage(
-        `Sync complete. Scanned ${data.scanned ?? 0} emails and updated ${data.updated ?? 0} row(s).`,
-      );
-      await loadJobs();
-    } catch {
-      setSyncMessage("Sync failed. Please try again.");
-    } finally {
-      setSyncLoading(false);
-    }
-  }
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    if (watchInitializedRef.current) return;
+    watchInitializedRef.current = true;
+    void ensureRealtimeWatch("initial");
+  }, [status, ensureRealtimeWatch]);
 
-  async function enableRealtimeSync() {
-    setWatchLoading(true);
-    setSyncMessage("");
-    try {
-      const response = await fetch("/api/gmail/watch", { method: "POST" });
-      const data = (await response.json()) as {
-        error?: string;
-        expiration?: string;
-      };
-      if (!response.ok) {
-        setSyncMessage(data.error ?? "Failed to enable Gmail push watch.");
-        return;
-      }
-      const expiry = data.expiration ? new Date(Number(data.expiration)).toLocaleString() : "unknown";
-      setSyncMessage(`Realtime watch enabled. Gmail watch expires around: ${expiry}.`);
-    } catch {
-      setSyncMessage("Failed to enable Gmail push watch.");
-    } finally {
-      setWatchLoading(false);
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    if (!integrationStatus?.persistenceEnabled) return;
+    const expiration = integrationStatus.integration?.gmailWatchExpiration;
+    if (!expiration) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      void ensureRealtimeWatch("renew");
+      return;
     }
-  }
+    const expiryMs = new Date(expiration).getTime();
+    if (Number.isNaN(expiryMs)) {
+      void ensureRealtimeWatch("renew");
+      return;
+    }
+    const msUntilExpiry = expiryMs - Date.now();
+    if (msUntilExpiry <= 12 * 60 * 60 * 1000) {
+      void ensureRealtimeWatch("renew");
+    }
+  }, [status, integrationStatus, ensureRealtimeWatch]);
 
   async function saveJobEdits() {
     if (!jobDraft) return;
@@ -719,6 +809,38 @@ export default function Home() {
       setSaveMessage("Failed to save changes.");
     } finally {
       setSaveLoading(false);
+    }
+  }
+
+  async function deleteJob() {
+    if (!jobDraft) return;
+    const label = `${jobDraft.company} — ${jobDraft.jobTitle}`.trim() || "this row";
+    if (!window.confirm(`Delete application "${label}"? This removes the row from Google Sheets.`)) {
+      return;
+    }
+    setDeleteLoading(true);
+    setSaveMessage("");
+    try {
+      const response = await fetch("/api/jobs", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rowNumber: jobDraft.rowNumber }),
+      });
+      const data = (await response.json()) as { error?: string };
+      if (!response.ok) {
+        setSaveMessage(data.error ?? "Failed to delete application.");
+        return;
+      }
+      await loadJobs();
+      setJourneyModalJob(null);
+      setJobDraft(null);
+      setJourneyDraftStages([]);
+      setJourneyStageToAdd(JOURNEY_STAGE_OPTIONS[0]);
+      setSaveMessage("");
+    } catch {
+      setSaveMessage("Failed to delete application.");
+    } finally {
+      setDeleteLoading(false);
     }
   }
 
@@ -846,20 +968,6 @@ export default function Home() {
                 Add Application
               </button>
               <button
-                onClick={runSync}
-                disabled={syncLoading}
-                className="rounded-full bg-emerald-600 px-5 py-2 text-sm font-medium text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {syncLoading ? "Syncing..." : "Sync Gmail to Sheet"}
-              </button>
-              <button
-                onClick={enableRealtimeSync}
-                disabled={watchLoading}
-                className="rounded-full bg-sky-600 px-5 py-2 text-sm font-medium text-white transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {watchLoading ? "Enabling..." : "Enable Realtime Watch"}
-              </button>
-              <button
                 onClick={loadJobs}
                 disabled={jobsLoading}
                 className="rounded-full border border-zinc-300 px-5 py-2 text-sm font-medium text-zinc-900 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-900"
@@ -869,6 +977,33 @@ export default function Home() {
             </div>
             {syncMessage ? (
               <p className="text-sm text-zinc-700 dark:text-zinc-300">{syncMessage}</p>
+            ) : null}
+            {integrationStatus?.persistenceEnabled && integrationStatus.integration ? (
+              <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-3 text-xs dark:border-zinc-800 dark:bg-zinc-900/40">
+                <p className="font-medium text-zinc-800 dark:text-zinc-200">
+                  Sync status:{" "}
+                  <span
+                    className={
+                      integrationStatus.integration.lastSyncStatus === "error"
+                        ? "text-red-600 dark:text-red-400"
+                        : "text-emerald-600 dark:text-emerald-400"
+                    }
+                  >
+                    {integrationStatus.integration.lastSyncStatus ?? "unknown"}
+                  </span>
+                </p>
+                <p className="mt-1 text-zinc-600 dark:text-zinc-400">
+                  Last run:{" "}
+                  {integrationStatus.integration.lastSyncAt
+                    ? new Date(integrationStatus.integration.lastSyncAt).toLocaleString()
+                    : "never"}
+                </p>
+                {integrationStatus.integration.lastSyncError ? (
+                  <p className="mt-1 text-red-600 dark:text-red-400">
+                    {integrationStatus.integration.lastSyncError}
+                  </p>
+                ) : null}
+              </div>
             ) : null}
             <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-4">
               <div className="rounded-xl border border-zinc-200 p-4 dark:border-zinc-800">
@@ -908,6 +1043,7 @@ export default function Home() {
               {journeyTransitions.rows.length ? (
                 <JourneySankey
                   rows={journeyTransitions.rows}
+                  nodeJobCounts={journeyTransitions.nodeJobCounts}
                   stageRank={stageDisplayRank}
                   stageColors={STAGE_COLORS}
                   onInspectNode={(nodeId) => {
@@ -1440,28 +1576,39 @@ export default function Home() {
                       {saveMessage ? (
                         <p className="text-sm text-zinc-600 dark:text-zinc-300">{saveMessage}</p>
                       ) : null}
-                      <div className="flex items-center justify-end gap-2 pt-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
                         <button
                           type="button"
-                          className="rounded-lg border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700"
-                          onClick={() => {
-                            setJourneyModalJob(null);
-                            setJobDraft(null);
-                            setJourneyDraftStages([]);
-                            setJourneyStageToAdd(JOURNEY_STAGE_OPTIONS[0]);
-                            setSaveMessage("");
-                          }}
+                          className="rounded-lg border border-red-300 px-3 py-2 text-sm font-medium text-red-700 disabled:opacity-60 dark:border-red-900 dark:text-red-400"
+                          disabled={saveLoading || deleteLoading}
+                          onClick={() => void deleteJob()}
                         >
-                          Close
+                          {deleteLoading ? "Deleting..." : "Delete application"}
                         </button>
-                        <button
-                          type="button"
-                          className="rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
-                          disabled={saveLoading}
-                          onClick={() => void saveJobEdits()}
-                        >
-                          {saveLoading ? "Saving..." : "Save to Sheet"}
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            className="rounded-lg border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-700"
+                            disabled={deleteLoading}
+                            onClick={() => {
+                              setJourneyModalJob(null);
+                              setJobDraft(null);
+                              setJourneyDraftStages([]);
+                              setJourneyStageToAdd(JOURNEY_STAGE_OPTIONS[0]);
+                              setSaveMessage("");
+                            }}
+                          >
+                            Close
+                          </button>
+                          <button
+                            type="button"
+                            className="rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
+                            disabled={saveLoading || deleteLoading}
+                            onClick={() => void saveJobEdits()}
+                          >
+                            {saveLoading ? "Saving..." : "Save to Sheet"}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   ) : null}

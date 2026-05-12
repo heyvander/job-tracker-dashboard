@@ -1,4 +1,5 @@
 import { authOptions } from "@/lib/auth";
+import { emitSyncComplete } from "@/lib/syncEvents";
 import { ensureUserSheet } from "@/lib/userSheet";
 import { getIntegrationByEmail, integrationPersistenceEnabled, updateSyncState } from "@/lib/userIntegrationStore";
 import { google } from "googleapis";
@@ -53,7 +54,7 @@ function extractStatus(subject: string, snippet: string): JobStatus | null {
   const text = normalize(`${subject} ${snippet}`);
 
   if (
-    /(not moving forward|no longer moving forward|unfortunately|regret to inform|rejected|declined|position has been filled)/.test(
+    /(not be moving forward|not moving forward|no longer moving forward|proceed with other candidates|decided to proceed with other candidates|unfortunately|regret to inform|rejected|declined|position has been filled)/.test(
       text,
     )
   ) {
@@ -93,6 +94,43 @@ function getHeaderValue(
     headers?.find((header) => header.name?.toLowerCase() === name.toLowerCase())?.value ??
     ""
   );
+}
+
+function decodeBase64Url(value: string): string {
+  try {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+    return Buffer.from(padded, "base64").toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function extractTextFromGmailPayload(
+  payload?: {
+    body?: { data?: string | null } | null;
+    parts?: Array<{
+      mimeType?: string | null;
+      body?: { data?: string | null } | null;
+      parts?: Array<unknown> | null;
+    }> | null;
+  } | null,
+): string {
+  if (!payload) return "";
+  const direct = payload.body?.data ? decodeBase64Url(payload.body.data) : "";
+  let collected = direct;
+  const parts = payload.parts ?? [];
+  for (const part of parts) {
+    const mimeType = part.mimeType ?? "";
+    const text = part.body?.data ? decodeBase64Url(part.body.data) : "";
+    if (text && (mimeType.startsWith("text/plain") || mimeType.startsWith("text/html"))) {
+      collected += `\n${text}`;
+    }
+    if (part.parts?.length) {
+      collected += `\n${extractTextFromGmailPayload(part as never)}`;
+    }
+  }
+  return collected;
 }
 
 function toIsoDate(input?: string | null): string | null {
@@ -271,6 +309,7 @@ async function accessTokenFromRefreshToken(refreshToken: string): Promise<string
 }
 
 export async function POST(request: NextRequest) {
+  const debugMode = request.nextUrl.searchParams.get("debug") === "1";
   const session = await getServerSession(authOptions);
   const token = await getToken({
     req: request,
@@ -315,164 +354,202 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const ensuredSheet = await ensureUserSheet({
-    accessToken,
-    email: resolvedEmail,
-    defaultSheetName: process.env.GOOGLE_SHEETS_TAB,
-  });
-  ensuredSheetId = ensuredSheet.sheetId;
-  const sheetIdRaw = ensuredSheetId ?? integration?.sheetId ?? process.env.GOOGLE_SHEETS_ID;
-
-  if (!sheetIdRaw) {
-    return NextResponse.json(
-      {
-        error: "Missing sheet id for user (and GOOGLE_SHEETS_ID fallback not configured)",
-        diagnostics: {
-          resolvedEmail: resolvedEmail || null,
-          persistenceEnabled,
-          hasIntegrationSheetId: Boolean(integration?.sheetId),
-          hasGlobalSheetId: Boolean(process.env.GOOGLE_SHEETS_ID),
-        },
-      },
-      { status: 500 },
-    );
-  }
-  const sheetId = resolveSpreadsheetId(sheetIdRaw);
-
-  const auth = new google.auth.OAuth2();
-  auth.setCredentials({ access_token: accessToken });
-
-  const gmail = google.gmail({ version: "v1", auth });
-  const sheets = google.sheets({ version: "v4", auth });
-  let nextHistoryId: string | null = integration?.gmailHistoryId ?? null;
-
-  let sheetName = configuredSheetName;
-  if (!sheetName) {
-    const meta = await sheets.spreadsheets.get({
-      spreadsheetId: sheetId,
-      fields: "sheets(properties(title))",
+  try {
+    const ensuredSheet = await ensureUserSheet({
+      accessToken,
+      email: resolvedEmail,
+      defaultSheetName: process.env.GOOGLE_SHEETS_TAB,
     });
-    sheetName = meta.data.sheets?.[0]?.properties?.title ?? "Sheet1";
-  }
+    ensuredSheetId = ensuredSheet.sheetId;
+    const sheetIdRaw = ensuredSheetId ?? integration?.sheetId ?? process.env.GOOGLE_SHEETS_ID;
 
-  const range = `${sheetName}!A:Z`;
-  const sheet = await sheets.spreadsheets.values.get({
-    spreadsheetId: sheetId,
-    range,
-  });
-
-  const rows = sheet.data.values ?? [];
-  if (rows.length === 0) {
-    return NextResponse.json({ updated: 0, scanned: 0, details: [] });
-  }
-
-  const headerRowIndex = findHeaderRowIndex(rows as string[][]);
-  if (headerRowIndex < 0) {
-    return NextResponse.json(
-      {
-        error: "Could not find header row in the first 15 rows.",
-        diagnostics: {
-          usingSheetTab: sheetName,
+    if (!sheetIdRaw) {
+      return NextResponse.json(
+        {
+          error: "Missing sheet id for user (and GOOGLE_SHEETS_ID fallback not configured)",
+          diagnostics: {
+            resolvedEmail: resolvedEmail || null,
+            persistenceEnabled,
+            hasIntegrationSheetId: Boolean(integration?.sheetId),
+            hasGlobalSheetId: Boolean(process.env.GOOGLE_SHEETS_ID),
+          },
         },
-      },
-      { status: 400 },
-    );
-  }
+        { status: 500 },
+      );
+    }
+    const sheetId = resolveSpreadsheetId(sheetIdRaw);
 
-  const header = rows[headerRowIndex];
-  const col = {
-    company: findHeaderIndex(header, ["Company"]),
-    status: findHeaderIndex(header, ["Status", "Current Status"]),
-    journey: findHeaderIndex(header, ["Journey", "Pipeline Path", "Flow", "Application Journey"]),
-    followUp: findHeaderIndex(header, [
-      "Follow-Up Date",
-      "Follow Up Date",
-      "Followup Date",
-      "Next Follow Up",
-      "Next Follow-Up",
-    ]),
-  };
+    const auth = new google.auth.OAuth2();
+    auth.setCredentials({ access_token: accessToken });
 
-  if (col.company === -1 || col.status === -1 || col.followUp === -1) {
-    return NextResponse.json(
-      { error: "Sheet must include Company, Status, Follow-Up Date columns." },
-      { status: 400 },
-    );
-  }
+    const gmail = google.gmail({ version: "v1", auth });
+    const sheets = google.sheets({ version: "v4", auth });
+    let nextHistoryId: string | null = integration?.gmailHistoryId ?? null;
 
-  const companyToRow = new Map<string, { rowNumber: number; status: string; journey: string; rowValues: string[] }>();
-  rows.slice(headerRowIndex + 1).forEach((row, idx) => {
-    const companyName = normalize(row[col.company] ?? "");
-    if (!companyName) return;
-    companyToRow.set(companyName, {
-      rowNumber: idx + headerRowIndex + 2,
-      status: row[col.status] ?? "",
-      journey: col.journey >= 0 ? row[col.journey] ?? "" : "",
-      rowValues: [...row],
-    });
-  });
-
-  let messageIds: string[] | undefined;
-  if (integration?.gmailHistoryId) {
-    try {
-      const history = await gmail.users.history.list({
-        userId: "me",
-        startHistoryId: integration.gmailHistoryId,
-        historyTypes: ["messageAdded"],
-        maxResults: 200,
+    let sheetName = configuredSheetName;
+    if (!sheetName) {
+      const meta = await sheets.spreadsheets.get({
+        spreadsheetId: sheetId,
+        fields: "sheets(properties(title))",
       });
-      nextHistoryId = history.data.historyId ?? nextHistoryId;
-      const collected = new Set<string>();
-      for (const row of history.data.history ?? []) {
-        for (const added of row.messagesAdded ?? []) {
-          if (added.message?.id) collected.add(added.message.id);
+      sheetName = meta.data.sheets?.[0]?.properties?.title ?? "Sheet1";
+    }
+
+    const range = `${sheetName}!A:Z`;
+    const sheet = await sheets.spreadsheets.values.get({
+      spreadsheetId: sheetId,
+      range,
+    });
+
+    const rows = sheet.data.values ?? [];
+    if (rows.length === 0) {
+      return NextResponse.json({ updated: 0, scanned: 0, details: [] });
+    }
+
+    const headerRowIndex = findHeaderRowIndex(rows as string[][]);
+    if (headerRowIndex < 0) {
+      return NextResponse.json(
+        {
+          error: "Could not find header row in the first 15 rows.",
+          diagnostics: {
+            usingSheetTab: sheetName,
+          },
+        },
+        { status: 400 },
+      );
+    }
+
+    const header = rows[headerRowIndex];
+    const col = {
+      company: findHeaderIndex(header, ["Company"]),
+      status: findHeaderIndex(header, ["Status", "Current Status"]),
+      journey: findHeaderIndex(header, ["Journey", "Pipeline Path", "Flow", "Application Journey"]),
+      followUp: findHeaderIndex(header, [
+        "Follow-Up Date",
+        "Follow Up Date",
+        "Followup Date",
+        "Next Follow Up",
+        "Next Follow-Up",
+      ]),
+    };
+
+    if (col.company === -1 || col.status === -1 || col.followUp === -1) {
+      return NextResponse.json(
+        { error: "Sheet must include Company, Status, Follow-Up Date columns." },
+        { status: 400 },
+      );
+    }
+
+    const companyToRow = new Map<string, { rowNumber: number; status: string; journey: string; rowValues: string[] }>();
+    rows.slice(headerRowIndex + 1).forEach((row, idx) => {
+      const companyName = normalize(row[col.company] ?? "");
+      if (!companyName) return;
+      companyToRow.set(companyName, {
+        rowNumber: idx + headerRowIndex + 2,
+        status: row[col.status] ?? "",
+        journey: col.journey >= 0 ? row[col.journey] ?? "" : "",
+        rowValues: [...row],
+      });
+    });
+
+    let messageIds: string[] | undefined;
+    if (integration?.gmailHistoryId) {
+      try {
+        const history = await gmail.users.history.list({
+          userId: "me",
+          startHistoryId: integration.gmailHistoryId,
+          historyTypes: ["messageAdded"],
+          maxResults: 200,
+        });
+        nextHistoryId = history.data.historyId ?? nextHistoryId;
+        const collected = new Set<string>();
+        for (const row of history.data.history ?? []) {
+          for (const added of row.messagesAdded ?? []) {
+            if (added.message?.id) collected.add(added.message.id);
+          }
         }
+        messageIds = [...collected];
+      } catch (error) {
+        const status = (error as { code?: number; response?: { status?: number } })?.response?.status ??
+          (error as { code?: number })?.code;
+        if (status !== 404) throw error;
+        // Start history id expired or invalid; fall back to full mailbox query.
       }
-      messageIds = [...collected];
+    }
+    if (!messageIds) {
+      const gmailList = await gmail.users.messages.list({
+        userId: "me",
+        maxResults: 50,
+        q: 'newer_than:180d (subject:(application OR interview OR assessment OR offer OR update) OR from:(greenhouse.io OR lever.co OR workday.com OR smartrecruiters.com OR taleo.net OR icims.com))',
+      });
+      messageIds = gmailList.data.messages?.map((message) => message.id).filter(Boolean) as
+        | string[]
+        | undefined;
+    }
+
+    if (!messageIds?.length) {
+      if (persistenceEnabled && resolvedEmail) {
+        await updateSyncState({
+          email: resolvedEmail,
+          gmailHistoryId: nextHistoryId,
+          lastSyncStatus: "ok",
+        });
+        emitSyncComplete({
+          email: resolvedEmail,
+          scanned: 0,
+          updated: 0,
+          at: new Date().toISOString(),
+        });
+      }
+      return NextResponse.json({ updated: 0, scanned: 0, details: [] });
+    }
+
+    const updates: Array<{
+      company: string;
+      rowNumber: number;
+      newStatus: JobStatus;
+      previousStatus: string;
+    }> = [];
+    const debug: Array<{
+      messageId: string;
+      subject: string;
+      from: string;
+      matchedCompany?: string;
+      previousStatus?: string;
+      detectedStatus?: JobStatus | null;
+      action: "updated" | "skipped";
+      reason: string;
+    }> = [];
+
+    for (const messageId of messageIds) {
+    let message: { data?: { payload?: { headers?: Array<{ name?: string | null; value?: string | null }> }; snippet?: string | null; historyId?: string | null } } | null =
+      null;
+    try {
+      message = await gmail.users.messages.get({
+        userId: "me",
+        id: messageId,
+        format: "metadata",
+        metadataHeaders: ["Subject", "From", "Date"],
+      });
     } catch (error) {
       const status = (error as { code?: number; response?: { status?: number } })?.response?.status ??
         (error as { code?: number })?.code;
-      if (status !== 404) throw error;
-      // Start history id expired or invalid; fall back to full mailbox query.
+      if (status !== 404) {
+        throw error;
+      }
+      if (debugMode) {
+        debug.push({
+          messageId,
+          subject: "",
+          from: "",
+          action: "skipped",
+          reason: "Message not found in Gmail (likely deleted/moved)",
+        });
+      }
+      continue;
     }
-  }
-  if (!messageIds) {
-    const gmailList = await gmail.users.messages.list({
-      userId: "me",
-      maxResults: 50,
-      q: 'newer_than:180d (subject:(application OR interview OR assessment OR offer OR update) OR from:(greenhouse.io OR lever.co OR workday.com OR smartrecruiters.com OR taleo.net OR icims.com))',
-    });
-    messageIds = gmailList.data.messages?.map((message) => message.id).filter(Boolean) as
-      | string[]
-      | undefined;
-  }
-
-  if (!messageIds?.length) {
-    if (persistenceEnabled && resolvedEmail) {
-      await updateSyncState({
-        email: resolvedEmail,
-        gmailHistoryId: nextHistoryId,
-        lastSyncStatus: "ok",
-      });
-    }
-    return NextResponse.json({ updated: 0, scanned: 0, details: [] });
-  }
-
-  const updates: Array<{
-    company: string;
-    rowNumber: number;
-    newStatus: JobStatus;
-    previousStatus: string;
-  }> = [];
-
-  for (const messageId of messageIds) {
-    const message = await gmail.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: "metadata",
-      metadataHeaders: ["Subject", "From", "Date"],
-    });
-    const messageHistoryId = message.data.historyId;
+    if (!message) continue;
+    const messageHistoryId = message.data?.historyId;
     if (messageHistoryId) {
       try {
         const current = BigInt(nextHistoryId ?? "0");
@@ -483,11 +560,11 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const headers = message.data.payload?.headers;
+    const headers = message.data?.payload?.headers;
     const subject = getHeaderValue(headers, "Subject");
     const from = getHeaderValue(headers, "From");
     const messageDate = toIsoDate(getHeaderValue(headers, "Date"));
-    const snippet = message.data.snippet ?? "";
+    const snippet = message.data?.snippet ?? "";
 
     const normalizedFrom = normalize(from);
     let matchedCompany = "";
@@ -507,7 +584,18 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    if (!matched) continue;
+    if (!matched) {
+      if (debugMode) {
+        debug.push({
+          messageId,
+          subject,
+          from,
+          action: "skipped",
+          reason: "No matching company row found",
+        });
+      }
+      continue;
+    }
     const gemini = await classifyWithGemini({
       subject,
       from,
@@ -517,18 +605,74 @@ export async function POST(request: NextRequest) {
     });
     const llmStatus = gemini?.confidence && gemini.confidence >= 0.65 ? gemini.status ?? null : null;
     const detectedStatus = llmStatus ?? extractStatus(subject, snippet);
-    if (!detectedStatus) continue;
+    let finalDetectedStatus: JobStatus | null = detectedStatus;
+    if (!finalDetectedStatus) {
+      // Fallback: fetch fuller message body when snippet/metadata is inconclusive.
+      try {
+        const fullMessage = await gmail.users.messages.get({
+          userId: "me",
+          id: messageId,
+          format: "full",
+        });
+        const fullText = extractTextFromGmailPayload(fullMessage.data.payload as never);
+        finalDetectedStatus = extractStatus(subject, `${snippet} ${fullText.slice(0, 8000)}`);
+      } catch {
+        // Keep null and continue to skip below.
+      }
+    }
+
+    if (!finalDetectedStatus) {
+      if (debugMode) {
+        debug.push({
+          messageId,
+          subject,
+          from,
+          matchedCompany: matchedCompany || "(matched from subject)",
+          previousStatus: matched.status,
+          detectedStatus: null,
+          action: "skipped",
+          reason: "Status classifier returned null (including full-body fallback)",
+        });
+      }
+      continue;
+    }
     const companyKey = matchedCompany || normalize(subject);
     const previous = canonicalStatus(matched.status) ?? (matched.status as JobStatus | string);
     const previousPriority = STATUS_PRIORITY[previous as JobStatus] ?? 0;
-    const nextPriority = STATUS_PRIORITY[detectedStatus];
+    const nextPriority = STATUS_PRIORITY[finalDetectedStatus];
 
-    if (nextPriority < previousPriority) continue;
+    if (nextPriority < previousPriority) {
+      if (debugMode) {
+        debug.push({
+          messageId,
+          subject,
+          from,
+          matchedCompany: matchedCompany || "(matched from subject)",
+          previousStatus: matched.status,
+          detectedStatus: finalDetectedStatus,
+          action: "skipped",
+          reason: "Detected status is lower priority than current status",
+        });
+      }
+      continue;
+    }
 
     const existing = updates.find((update) => update.rowNumber === matched.rowNumber);
     if (existing) {
       if (STATUS_PRIORITY[existing.newStatus] < nextPriority) {
-        existing.newStatus = detectedStatus;
+        existing.newStatus = finalDetectedStatus;
+      }
+      if (debugMode) {
+        debug.push({
+          messageId,
+          subject,
+          from,
+          matchedCompany: matchedCompany || "(matched from subject)",
+          previousStatus: matched.status,
+          detectedStatus: finalDetectedStatus,
+          action: "skipped",
+          reason: "Duplicate row candidate in same run; kept higher-priority status",
+        });
       }
       continue;
     }
@@ -536,18 +680,30 @@ export async function POST(request: NextRequest) {
     updates.push({
       company: companyKey || "(matched)",
       rowNumber: matched.rowNumber,
-      newStatus: detectedStatus,
+      newStatus: finalDetectedStatus,
       previousStatus: matched.status,
     });
+    if (debugMode) {
+      debug.push({
+        messageId,
+        subject,
+        from,
+        matchedCompany: companyKey || "(matched)",
+        previousStatus: matched.status,
+          detectedStatus: finalDetectedStatus,
+        action: "updated",
+        reason: "Row updated",
+      });
+    }
 
     const nextFollowUp =
-      detectedStatus === "Rejected" || detectedStatus === "Offer"
+      finalDetectedStatus === "Rejected" || finalDetectedStatus === "Offer"
         ? ""
         : messageDate ?? datePlusDays(7);
 
-    const nextJourney = appendJourney(matched.journey, detectedStatus);
+    const nextJourney = appendJourney(matched.journey, finalDetectedStatus);
     const rowValues = [...matched.rowValues];
-    rowValues[col.status] = detectedStatus;
+    rowValues[col.status] = finalDetectedStatus;
     rowValues[col.followUp] = nextFollowUp;
     if (col.journey >= 0) rowValues[col.journey] = nextJourney;
 
@@ -560,22 +716,45 @@ export async function POST(request: NextRequest) {
       },
     });
 
-    matched.status = detectedStatus;
+    matched.status = finalDetectedStatus;
     matched.journey = nextJourney;
     matched.rowValues = rowValues;
-  }
+    }
 
-  if (persistenceEnabled && resolvedEmail) {
-    await updateSyncState({
-      email: resolvedEmail,
-      gmailHistoryId: nextHistoryId,
-      lastSyncStatus: "ok",
+    if (persistenceEnabled && resolvedEmail) {
+      await updateSyncState({
+        email: resolvedEmail,
+        gmailHistoryId: nextHistoryId,
+        lastSyncStatus: "ok",
+      });
+      await emitSyncComplete({
+        email: resolvedEmail,
+        scanned: messageIds.length,
+        updated: updates.length,
+        at: new Date().toISOString(),
+      });
+    }
+
+    return NextResponse.json({
+      updated: updates.length,
+      scanned: messageIds.length,
+      details: updates,
+      ...(debugMode ? { debug } : {}),
     });
+  } catch (error) {
+    if (persistenceEnabled && resolvedEmail) {
+      await updateSyncState({
+        email: resolvedEmail,
+        lastSyncStatus: "error",
+        lastSyncError: error instanceof Error ? error.message : "Unknown sync error",
+      });
+    }
+    return NextResponse.json(
+      {
+        error: "Sync failed unexpectedly",
+        details: error instanceof Error ? error.message : "Unknown sync error",
+      },
+      { status: 500 },
+    );
   }
-
-  return NextResponse.json({
-    updated: updates.length,
-    scanned: messageIds.length,
-    details: updates,
-  });
 }

@@ -26,6 +26,11 @@ cp .env.example .env.local
 
 For multi-user mode, set `POSTGRES_URL` so the app can persist per-user Gmail watch metadata and integration state.
 
+For reliable realtime sync events across multiple instances, set:
+
+- `REDIS_URL` (for example, Upstash Redis TLS URL)
+- `SYNC_EVENTS_CHANNEL` (optional, defaults to `job-tracker:sync-complete`)
+
 ## Docker
 
 Build and run the app plus sync worker:
@@ -68,6 +73,11 @@ GET /api/integration/status
 ```
 
 It returns safe diagnostics only (e.g. whether tokens exist, sheet id/url, history/watch state), and does not return raw token values.
+
+## Realtime Event Delivery
+
+- When `REDIS_URL` is set, sync completion events are published/subscribed through Redis so SSE updates work reliably across serverless instances and restarts.
+- Without `REDIS_URL`, the app falls back to in-memory events (works locally, but may miss events in distributed/serverless production).
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
